@@ -1,0 +1,8 @@
+# Requirements for Depth Pro model
+
+torch==2.1.2
+torchvision==0.16.2
+timm
+numpy<2
+pillow_heif
+matplotlib

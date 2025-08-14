@@ -9,6 +9,9 @@ import PIL.Image
 import torch
 from matplotlib import pyplot as plt
 from cog import BasePredictor, Input, Path, BaseModel
+from typing import Optional
+
+import math
 
 from src.depth_pro import create_model_and_transforms, load_rgb
 from src.depth_pro.depth_pro import DepthProConfig
@@ -31,11 +34,10 @@ os.environ.update(
     }
 )
 
-
 class ModelOutput(BaseModel):
     npz: Path
     color_map: Path
-
+    focal_length: float
 
 def download_weights(url, dest):
     start = time.time()
@@ -69,24 +71,36 @@ class Predictor(BasePredictor):
     def predict(
         self,
         image_path: Path = Input(description="Input image"),
+        focal_length: Optional[float] = Input(description="Focal length in pixels (optional)"),
     ) -> ModelOutput:
-        """Run a single prediction on the model"""
+        image, _, f_px_exif = load_rgb(image_path)
 
-        image, _, f_px = load_rgb(image_path)
+        # Choose which focal length to use for inference
+        f_px_used = focal_length if focal_length is not None else f_px_exif
 
-        # Run prediction. If `f_px` is provided, it is used to estimate the final metric depth,
-        # otherwise the model estimates `f_px` to compute the depth metricness.
-        prediction = self.model.infer(self.transform(image), f_px=f_px)
+        # Run inference (model will estimate f if None)
+        prediction = self.model.infer(self.transform(image), f_px=f_px_used)
 
-        # Extract the depth and focal length.
+        # Decide what to *return* as focal length
+        f_px_out = f_px_used
+        if f_px_out is None:
+            f_est = prediction.get("focallength_px", None)
+            if f_est is not None:
+                # f_est can be a tensor; convert and sanitize
+                try:
+                    f_est = float(getattr(f_est.detach().cpu(), "item", lambda: f_est)())
+                    print("Estimated focal length:", f_est)
+                except Exception:
+                    f_est = float(f_est)
+                if math.isfinite(f_est):
+                    f_px_out = f_est
+        else:
+            print("Used focal length:", f_px_used)
+
+        # Extract the depth
         depth = prediction["depth"].detach().cpu().numpy().squeeze()
-        if f_px is not None:
-            print(f"Focal length (from exif): {f_px:0.2f}")
-        elif prediction["focallength_px"] is not None:
-            focallength_px = prediction["focallength_px"].detach().cpu().item()
-            print(f"Estimated focal length: {focallength_px}")
-
         inverse_depth = 1 / depth
+
         # Visualize inverse depth instead of depth, clipped to [0.1m;250m] range for better visualization.
         max_invdepth_vizu = min(inverse_depth.max(), 1 / 0.1)
         min_invdepth_vizu = max(1 / 250, inverse_depth.min())
@@ -103,8 +117,12 @@ class Predictor(BasePredictor):
         cmap = plt.get_cmap("turbo")
         color_depth = (cmap(inverse_depth_normalized)[..., :3] * 255).astype(np.uint8)
         out_color_map = "/tmp/out.jpg"
-        PIL.Image.fromarray(color_depth).save(out_color_map, format="JPEG", quality=90)
 
+        PIL.Image.fromarray(color_depth).save(out_color_map, format="JPEG", quality=90)
         PIL.Image.fromarray(color_depth).save("out.jpg", format="JPEG", quality=90)
 
-        return ModelOutput(npz=Path(out_npz), color_map=Path(out_color_map))
+        return ModelOutput(
+            npz=Path(out_npz),
+            color_map=Path(out_color_map),
+            focal_length=float(f_px_out)
+        )
